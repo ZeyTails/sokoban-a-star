@@ -8,13 +8,18 @@ from __future__ import print_function
 from collections import namedtuple
 from enum import Enum
 
+import threading
+import time
 import json
 import sys
 import tkinter as tk
+from types import SimpleNamespace
+
+import solver_astar
 
 Tile = namedtuple("Tile", "wall worker dock box")
 Dir = Enum('Dir', 'UP DN LT RT')
-Key = Enum('Key', 'UP DOWN LEFT RIGHT QUIT SKIP')
+Key = Enum('Key', 'UP DOWN LEFT RIGHT QUIT SKIP SOLVE PREV RESET INFO EXPORT SPEED1 SPEED2 SPEED3')
 
 
 class World:
@@ -192,6 +197,25 @@ class GameView:
         self._window.bind("<KeyPress>", self._on_key_press)
         self._window.mainloop()
 
+    def schedule(self, delay_ms, callback):
+        self._window.after(delay_ms, callback)
+
+    def show_text_dialog(self, title, text):
+        dialog = tk.Toplevel(self._window)
+        dialog.title(title)
+        frame = tk.Frame(dialog)
+        frame.pack(fill=tk.BOTH, expand=True)
+        text_widget = tk.Text(frame, width=80, height=30)
+        text_widget.insert("1.0", text)
+        text_widget.config(state=tk.DISABLED)
+        text_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar = tk.Scrollbar(frame, command=text_widget.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        text_widget.config(yscrollcommand=scrollbar.set)
+
+    def show_tree_dialog(self, title, detail_text, tree_data):
+        pass
+
     def _on_key_press(self, event):
         """Maps the key pressed, and invokes key handler callback."""
         key_map = {
@@ -200,7 +224,21 @@ class GameView:
             "Right": Key.RIGHT,
             "Down": Key.DOWN,
             "q": Key.QUIT,
-            "s": Key.SKIP,
+            "n": Key.SKIP,
+            "N": Key.SKIP,
+            "s": Key.SOLVE,
+            "S": Key.SOLVE,
+            "p": Key.PREV,
+            "P": Key.PREV,
+            "r": Key.RESET,
+            "R": Key.RESET,
+            "i": Key.INFO,
+            "I": Key.INFO,
+            "e": Key.EXPORT,
+            "E": Key.EXPORT,
+            "1": Key.SPEED1,
+            "2": Key.SPEED2,
+            "3": Key.SPEED3,
         }
         try:
             self._event_handler.handle_key(key_map[event.keysym])
@@ -216,6 +254,15 @@ class Sokoban:
         self._current = 0
         self._engine = GameEngine()
         self._view = GameView()
+        self._solving = False
+        self._solution_moves = []
+        self._last_solve = None
+        self._last_solve_world = None
+        self._speed_level = 2
+        self._move_delay_ms = 80
+        self._tree_topk = 5
+        self._trace_limit_display = 40
+        self._trace_limit_export = 200
         self._view.load_images()
 
         self._world = World(self._levels[self._current])
@@ -230,10 +277,122 @@ class Sokoban:
         self._view.setup_world(self._world)
         self._view.show_world(self._world)
 
+    def _goto_prev(self):
+        """Decrements level and update world."""
+        self._current = (self._current - 1) % len(self._levels)
+        self._world = World(self._levels[self._current])
+        self._view.setup_world(self._world)
+        self._view.show_world(self._world)
+
+    def _reset_level(self):
+        """Reloads current level."""
+        self._world = World(self._levels[self._current])
+        self._view.setup_world(self._world)
+        self._view.show_world(self._world)
+
     def _move(self, direction):
         """Make move and update in view."""
         self._engine.move(direction, self._world)
         self._view.show_world(self._world)
+
+    def _solve_and_play(self):
+        if self._solving:
+            return
+        self._solving = True
+
+        def run_solver():
+            snapshot = self._snapshot_world(self._world)
+            result = solver_astar.solve_astar(
+                self._world, trace_limit=self._trace_limit_display
+            )
+            self._view.schedule(0, lambda: self._start_solution(result))
+            self._last_solve_world = snapshot
+
+        thread = threading.Thread(target=run_solver)
+        thread.daemon = True
+        thread.start()
+
+    def _start_solution(self, result):
+        self._last_solve = result
+        if result["cost"] < 0:
+            print("Aucune solution")
+            self._solving = False
+            return
+
+        print(solver_astar.format_summary(result))
+        self._solution_moves = list(result["moves"])
+        self._animate_solution_step(0)
+
+    def _animate_solution_step(self, index):
+        if index >= len(self._solution_moves):
+            self._solving = False
+            if self._engine.is_game_over(self._world):
+                self._goto_next()
+            return
+
+        move = self._solution_moves[index]
+        if move == "U":
+            self._move(Dir.UP)
+        elif move == "D":
+            self._move(Dir.DN)
+        elif move == "L":
+            self._move(Dir.LT)
+        elif move == "R":
+            self._move(Dir.RT)
+        self._view.schedule(
+            self._move_delay_ms, lambda: self._animate_solution_step(index + 1)
+        )
+
+    def _show_info(self):
+        if not self._last_solve:
+            print("Aucune donnee de solveur")
+            return
+        detail = solver_astar.format_details(self._last_solve)
+        self._view.show_text_dialog("Details A*", detail)
+
+    def _export_tree(self):
+        if not self._last_solve:
+            print("Aucune donnee de solveur")
+            return
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        base = "astar_tree_{0}".format(stamp)
+        dot_path = base + ".dot"
+
+        def run_export():
+            snapshot = self._last_solve_world or self._snapshot_world(self._world)
+            result = solver_astar.solve_astar(
+                snapshot, tree_limits=None, trace_limit=self._trace_limit_export
+            )
+            tree_data = result.get("tree")
+            if not tree_data or not tree_data.get("nodes"):
+                msg = "Aucun arbre a exporter"
+            else:
+                solver_astar.export_tree_dot(tree_data, dot_path)
+                msg = "Arbre exporte: {0}".format(dot_path)
+            self._view.schedule(0, lambda: self._finish_export(msg))
+
+        thread = threading.Thread(target=run_export)
+        thread.daemon = True
+        thread.start()
+
+    def _finish_export(self, msg):
+        print(msg)
+        self._view.show_text_dialog("Export", msg)
+
+    @staticmethod
+    def _snapshot_world(world):
+        return SimpleNamespace(
+            worker_pos=[world.worker_pos[0]],
+            box_pos=list(world.box_pos),
+            dock_pos=list(world.dock_pos),
+            wall_pos=list(world.wall_pos),
+        )
+
+    def _set_speed(self, level):
+        speeds = {1: 150, 2: 80, 3: 30}
+        self._speed_level = level
+        self._move_delay_ms = speeds[level]
+        print("Vitesse reglee a {0}".format(level))
 
     def handle_key(self, key):
         """Processes a key event.
@@ -244,6 +403,18 @@ class Sokoban:
         """
         if key == Key.QUIT:
             self._view.quit()
+        elif key == Key.INFO:
+            self._show_info()
+        elif key == Key.EXPORT:
+            self._export_tree()
+        elif key == Key.SPEED1:
+            self._set_speed(1)
+        elif key == Key.SPEED2:
+            self._set_speed(2)
+        elif key == Key.SPEED3:
+            self._set_speed(3)
+        elif self._solving:
+            return
         elif key == Key.UP:
             self._move(Dir.UP)
         elif key == Key.RIGHT:
@@ -254,6 +425,12 @@ class Sokoban:
             self._move(Dir.DN)
         elif key == Key.SKIP:
             self._goto_next()
+        elif key == Key.SOLVE:
+            self._solve_and_play()
+        elif key == Key.PREV:
+            self._goto_prev()
+        elif key == Key.RESET:
+            self._reset_level()
 
         if self._engine.is_game_over(self._world):
             self._goto_next()

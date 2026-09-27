@@ -9,13 +9,17 @@ from collections import namedtuple
 from builtins import open as xopen
 from enum import Enum
 
+import argparse
 import json
 import sys
+import time
 import pygame
+
+import solver_astar
 
 Tile = namedtuple("Tile", "wall worker dock box")
 Dir = Enum('Dir', 'UP DN LT RT')
-Key = Enum('Key', 'UP DOWN LEFT RIGHT QUIT SKIP')
+Key = Enum('Key', 'UP DOWN LEFT RIGHT QUIT SKIP SOLVE PREV RESET INFO SPEED1 SPEED2 SPEED3')
 
 
 class World:
@@ -199,7 +203,14 @@ class GameView:
             pygame.K_RIGHT: Key.RIGHT,
             pygame.K_DOWN: Key.DOWN,
             pygame.K_q: Key.QUIT,
-            pygame.K_s: Key.SKIP,
+            pygame.K_n: Key.SKIP,
+            pygame.K_s: Key.SOLVE,
+            pygame.K_p: Key.PREV,
+            pygame.K_r: Key.RESET,
+            pygame.K_i: Key.INFO,
+            pygame.K_1: Key.SPEED1,
+            pygame.K_2: Key.SPEED2,
+            pygame.K_3: Key.SPEED3,
         }
         event = pygame.event.wait()
         if event.type == pygame.QUIT:
@@ -224,6 +235,10 @@ class Sokoban:
         self._current = 0
         self._engine = GameEngine()
         self._view = GameView()
+        self._solving = False
+        self._last_solve = None
+        self._speed_level = 2
+        self._move_delay = 0.08
         self._view.load_images()
 
         self._world = World(self._levels[self._current])
@@ -238,10 +253,66 @@ class Sokoban:
         self._view.setup_world(self._world)
         self._view.show_world(self._world)
 
+    def _goto_prev(self):
+        """Decrements level and update world."""
+        self._current = (self._current - 1) % len(self._levels)
+        self._world = World(self._levels[self._current])
+        self._view.setup_world(self._world)
+        self._view.show_world(self._world)
+
+    def _reset_level(self):
+        """Reloads current level."""
+        self._world = World(self._levels[self._current])
+        self._view.setup_world(self._world)
+        self._view.show_world(self._world)
+
     def _move(self, direction):
         """Make move and update in view."""
         self._engine.move(direction, self._world)
         self._view.show_world(self._world)
+
+    def _solve_and_play(self):
+        if self._solving:
+            return
+        self._solving = True
+
+        result = solver_astar.solve_astar(self._world)
+        self._last_solve = result
+        if result["cost"] < 0:
+            print("Aucune solution")
+            self._solving = False
+            return
+
+        print(solver_astar.format_summary(result))
+
+        for move in result["moves"]:
+            if move == "U":
+                self._move(Dir.UP)
+            elif move == "D":
+                self._move(Dir.DN)
+            elif move == "L":
+                self._move(Dir.LT)
+            elif move == "R":
+                self._move(Dir.RT)
+            pygame.event.pump()
+            time.sleep(self._move_delay)
+
+        self._solving = False
+        if self._engine.is_game_over(self._world):
+            self._goto_next()
+
+    def _show_info(self):
+        if not self._last_solve:
+            print("Aucune donnee de solveur")
+            return
+        print(solver_astar.format_search_report(self._last_solve))
+        print("Arbre graphique disponible dans sokoban_tk.py")
+
+    def _set_speed(self, level):
+        speeds = {1: 0.15, 2: 0.08, 3: 0.03}
+        self._speed_level = level
+        self._move_delay = speeds[level]
+        print("Vitesse reglee a {0}".format(level))
 
     def handle_key(self, key):
         """Processes a key event.
@@ -252,6 +323,16 @@ class Sokoban:
         """
         if key == Key.QUIT:
             self._view.quit()
+        elif key == Key.INFO:
+            self._show_info()
+        elif key == Key.SPEED1:
+            self._set_speed(1)
+        elif key == Key.SPEED2:
+            self._set_speed(2)
+        elif key == Key.SPEED3:
+            self._set_speed(3)
+        elif self._solving:
+            return
         elif key == Key.UP:
             self._move(Dir.UP)
         elif key == Key.RIGHT:
@@ -262,6 +343,12 @@ class Sokoban:
             self._move(Dir.DN)
         elif key == Key.SKIP:
             self._goto_next()
+        elif key == Key.SOLVE:
+            self._solve_and_play()
+        elif key == Key.PREV:
+            self._goto_prev()
+        elif key == Key.RESET:
+            self._reset_level()
 
         if self._engine.is_game_over(self._world):
             self._goto_next()
@@ -275,4 +362,26 @@ def load_levels():
         exit(1)
 
 if __name__ == "__main__":
-    Sokoban(load_levels())
+    parser = argparse.ArgumentParser(description="Sokoban")
+    parser.add_argument(
+        "--solve-level",
+        type=int,
+        default=None,
+        help="Solve level index (0-based) and exit",
+    )
+    args = parser.parse_args()
+
+    levels = load_levels()
+    if args.solve_level is not None:
+        if args.solve_level < 0 or args.solve_level >= len(levels):
+            print("Index de niveau invalide", file=sys.stderr)
+            sys.exit(1)
+        result = solver_astar.solve_astar(levels[args.solve_level])
+        if result["cost"] < 0:
+            print("Aucune solution")
+        else:
+            print("Mouvements: {0}".format(result["moves_str"]))
+            print(solver_astar.format_summary(result))
+        sys.exit(0)
+
+    Sokoban(levels)
